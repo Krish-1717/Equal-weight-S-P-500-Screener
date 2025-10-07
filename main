@@ -1,0 +1,142 @@
+import numpy as np
+import pandas as pd
+import math
+import yfinance as yf
+import sys
+
+print("Fetching S&P 500 tickers...")
+wiki_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+sp500_table = None
+try:
+    import requests as _requests
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; Bot/0.1)"}
+    resp = _requests.get(wiki_url, headers=headers, timeout=10)
+    if resp.status_code == 200:
+        sp500_table = pd.read_html(resp.text)[0]
+    else:
+        print(f"Warning: wiki returned status {resp.status_code}; will try local CSV fallback")
+except Exception as e:
+    print(f"Warning: failed to fetch S&P 500 table from web: {e}")
+
+# Fallback to local CSV if web fetch failed
+if sp500_table is None:
+    csv_candidates = ['sp_500_stocks.csv', 'sp_500_stocks (1).csv']
+    for c in csv_candidates:
+        try:
+            sp500_table = pd.read_csv(c)
+            print(f"Loaded S&P 500 tickers from local file: {c}")
+            break
+        except Exception:
+            sp500_table = None
+    if sp500_table is None:
+        raise SystemExit('Unable to load S&P 500 tickers from web or local CSV. Please provide sp_500_stocks.csv')
+
+# Normalize tickers for yfinance (BRK.B -> BRK-B) and keep sector mapping
+tickers = [str(t).strip().replace('.', '-') for t in sp500_table['Symbol'].tolist()]
+sectors = {str(r['Symbol']).strip().replace('.', '-'): r['GICS Sector'] for _, r in sp500_table.iterrows()}
+
+print(f"Found {len(tickers)} tickers.")
+
+name = input("Enter your name: ")
+current_date = input("Enter today's date (YYYY-MM-DD): ")
+try:
+    portfolio_value = float(input("Enter your total portfolio value ($): "))
+except ValueError:
+    sys.exit("Portfolio value must be a number")
+
+print("Downloading latest stock prices (this may take a moment)...")
+try:
+    raw = yf.download(tickers, period="1d", threads=True, progress=False)
+except Exception as e:
+    sys.exit(f"Failed to download prices from yfinance: {e}")
+
+# Extract adjusted close prices
+last_prices = pd.Series(dtype=float)
+if isinstance(raw, pd.DataFrame):
+    # raw may have columns like ('Adj Close', 'AAPL') or MultiIndex; try to access 'Adj Close'
+    if 'Adj Close' in raw.columns:
+        adj = raw['Adj Close']
+    else:
+        # If columns are multiindex with tickers at top-level, try to flatten
+        try:
+            # attempt to get column level names
+            adj = raw.xs('Adj Close', axis=1, level=0)
+        except Exception:
+            adj = raw
+    try:
+        last_prices = adj.iloc[-1]
+    except Exception:
+        last_prices = pd.Series(dtype=float)
+else:
+    # single ticker: raw may be a Series
+    try:
+        last_prices = pd.Series({tickers[0]: float(raw)})
+    except Exception:
+        last_prices = pd.Series(dtype=float)
+
+if len(tickers) == 0:
+    sys.exit('No tickers found')
+
+equal_weight = 1.0 / len(tickers)
+shares_to_buy = {}
+investment_per_stock = {}
+total_invested = 0.0
+
+for ticker in tickers:
+    allocation = portfolio_value * equal_weight
+    price = last_prices.get(ticker, float('nan'))
+    if pd.isna(price) or price <= 0:
+        shares = 0
+        cost = 0.0
+    else:
+        shares = math.floor(allocation / price)
+        cost = shares * price
+    shares_to_buy[ticker] = shares
+    investment_per_stock[ticker] = cost
+    total_invested += cost
+
+leftover_cash = portfolio_value - total_invested
+
+portfolio_df = pd.DataFrame({
+    'Ticker': tickers,
+    'Sector': [sectors.get(t, '') for t in tickers],
+    'Price ($)': [last_prices.get(t, float('nan')) for t in tickers],
+    'Equal Weight': [equal_weight for _ in tickers],
+    'Shares to Buy': [shares_to_buy.get(t, 0) for t in tickers],
+    'Investment ($)': [investment_per_stock.get(t, 0.0) for t in tickers],
+})
+
+file_name = "Equal_Weight_SP500.xlsx"
+writer = pd.ExcelWriter(file_name, engine='xlsxwriter')
+portfolio_df.to_excel(writer, sheet_name='Portfolio', index=False)
+
+workbook = writer.book
+worksheet = writer.sheets['Portfolio']
+money_fmt = workbook.add_format({'num_format': '$#,##0.00'})
+percent_fmt = workbook.add_format({'num_format': '0.00%'})
+bold = workbook.add_format({'bold': True})
+
+worksheet.set_column('A:A', 10)
+worksheet.set_column('B:B', 20)
+worksheet.set_column('C:C', 12, money_fmt)
+worksheet.set_column('D:D', 15, percent_fmt)
+worksheet.set_column('E:E', 12)
+worksheet.set_column('F:F', 15, money_fmt)
+
+worksheet.write('H1', 'Investor Name:', bold)
+worksheet.write('I1', name)
+worksheet.write('H2', 'Date:', bold)
+worksheet.write('I2', current_date)
+worksheet.write('H3', 'Total Portfolio ($):', bold)
+worksheet.write('I3', portfolio_value, money_fmt)
+worksheet.write('H4', 'Total Invested ($):', bold)
+worksheet.write('I4', total_invested, money_fmt)
+worksheet.write('H5', 'Leftover Cash ($):', bold)
+worksheet.write('I5', leftover_cash, money_fmt)
+
+writer.close()
+print(f"Portfolio saved to {file_name}")
+print(f"Total invested: ${total_invested:.2f}, leftover cash: ${leftover_cash:.2f}")
+
+
+
